@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.env
+
+# Large raw data files (re-downloadable via 01_fetch_pbp_data.py)
+data/raw/
