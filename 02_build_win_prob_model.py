@@ -193,7 +193,7 @@ def build_logistic_model(df: pd.DataFrame) -> Pipeline:
     # Pipeline: polynomial features + calibrated logistic regression
     model = Pipeline([
         ("poly", PolynomialFeatures(degree=3, interaction_only=False, include_bias=False)),
-        ("lr", LogisticRegression(max_iter=1000, C=1.0)),
+        ("lr", LogisticRegression(max_iter=5000, C=1.0)),
     ])
 
     # Fit with calibration for better probability estimates

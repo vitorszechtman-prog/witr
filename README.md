@@ -12,18 +12,19 @@ win probabilities against a fair-value model built from historical play-by-play 
 ## Project Structure
 
 ```
-kalshi-nba-bot/
-├── scripts/
-│   ├── 01_fetch_pbp_data.py        # Pull NBA play-by-play data (historical)
-│   ├── 02_build_win_prob_model.py   # Build empirical win probability surface
-│   ├── 03_kalshi_live_logger.py     # Log live Kalshi NBA prices tick-by-tick
-│   ├── 04_nba_live_game_state.py    # Track live NBA game state (score, time, etc.)
-│   ├── 05_edge_analysis.py          # Compare model vs Kalshi prices (backtest)
-│   └── utils.py                     # Shared utilities
-├── analysis/
-│   └── win_prob_heatmap.py          # Visualize the win probability surface
-├── data/                            # Stored data (gitignore large files)
-├── logs/                            # Live logger output
+witr/
+├── 01_fetch_pbp_data.py        # Process NBA play-by-play CSV data into game states
+├── 02_build_win_prob_model.py   # Build empirical win probability surface
+├── 03_kalshi_live_logger.py     # Log live Kalshi NBA prices tick-by-tick
+├── 04_nba_live_game_state.py    # Track live NBA game state (score, time, etc.)
+├── 05_edge_analysis.py          # Compare model vs Kalshi prices (backtest)
+├── utils.py                     # Shared utilities
+├── data/
+│   ├── raw/                     # Source CSV files from shufinskiy/nba_data
+│   ├── game_states_*.parquet    # Per-play game state snapshots
+│   ├── game_outcomes_*.parquet  # Game-level outcomes
+│   └── win_prob_*.parquet       # Win probability lookup table
+├── logs/                        # Live logger output
 └── requirements.txt
 ```
 
@@ -37,8 +38,8 @@ source venv/bin/activate  # or venv\Scripts\activate on Windows
 # 2. Install dependencies
 pip install -r requirements.txt
 
-# 3. Pull historical NBA data (takes ~10-20 min for multiple seasons)
-python scripts/01_fetch_pbp_data.py --seasons 2022 2023 2024
+# 3. Process historical NBA play-by-play data (auto-downloads from GitHub if needed)
+python 01_fetch_pbp_data.py --seasons 2022 2023 2024
 
 # 4. Build win probability model
 python scripts/02_build_win_prob_model.py
@@ -57,9 +58,13 @@ python scripts/05_edge_analysis.py
 
 ## Key Concepts
 
+### Data Source
+- Play-by-play data from [shufinskiy/nba_data](https://github.com/shufinskiy/nba_data) (sourced from stats.nba.com)
+- 3 seasons (2022-2024): ~3,690 games, ~472K game-state snapshots
+
 ### Win Probability Model
 - Empirical model: P(home_win | score_margin, seconds_remaining)
-- Built from ~1,200+ NBA games per season of play-by-play data
+- Built from ~1,200+ NBA games per season of real play-by-play data
 - Granularity: 1-point margin buckets × 30-second time buckets
 - Smoothed via kernel regression to handle sparse cells
 

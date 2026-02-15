@@ -13,7 +13,7 @@ from loguru import logger
 load_dotenv()
 
 # ── Paths ──────────────────────────────────────────────────────────────────
-PROJECT_ROOT = Path(__file__).parent.parent
+PROJECT_ROOT = Path(__file__).parent
 DATA_DIR = PROJECT_ROOT / "data"
 LOGS_DIR = PROJECT_ROOT / "logs"
 DATA_DIR.mkdir(exist_ok=True)
