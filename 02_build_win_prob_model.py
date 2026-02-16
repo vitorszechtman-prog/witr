@@ -177,14 +177,21 @@ TEAM_FEATURE_COLS = [
     "home_last10", "away_last10", "strength_diff",
 ]
 
+# Extended features including net rating and pace
+EXTENDED_FEATURE_COLS = TEAM_FEATURE_COLS + [
+    "home_net_rating", "away_net_rating", "net_rating_diff",
+    "home_pace", "away_pace", "expected_pace",
+]
+
 
 def build_logistic_model(df: pd.DataFrame) -> dict:
     """
-    Build two models:
+    Build three models:
         1. Baseline: P(home_win) = f(margin, time)
         2. Enhanced: P(home_win) = f(margin, time, team_strength, L10, home_court_adv)
+        3. Full: P(home_win) = f(margin, time, team features, net_rating, pace)
 
-    Returns dict with both models and feature metadata.
+    Returns dict with all models and feature metadata.
     """
     from sklearn.metrics import log_loss, brier_score_loss
 
@@ -216,14 +223,13 @@ def build_logistic_model(df: pd.DataFrame) -> dict:
     # --- Enhanced model ---
     has_team_features = all(c in reg.columns for c in TEAM_FEATURE_COLS)
     enhanced = None
+    enhanced_features = None
 
     if has_team_features:
         logger.info("Building ENHANCED logistic model (+ team strength, L10, home court)...")
 
-        # Filter to games where teams have played >= 10 games (features are meaningful)
         has_data = reg.copy()
 
-        # Enhanced features
         enhanced_features = base_features + TEAM_FEATURE_COLS + [
             "strength_x_time",  # team quality matters more early
             "margin_x_strength",  # margin means more when teams are mismatched
@@ -245,15 +251,60 @@ def build_logistic_model(df: pd.DataFrame) -> dict:
         ll_enh = log_loss(y_enh, y_pred_enh)
         bs_enh = brier_score_loss(y_enh, y_pred_enh)
         logger.info(f"  Enhanced — Log loss: {ll_enh:.4f}, Brier score: {bs_enh:.4f}")
-        logger.info(f"  Improvement — Log loss: {ll_base - ll_enh:+.4f}, Brier: {bs_base - bs_enh:+.4f}")
+        logger.info(f"  Improvement over baseline — Log loss: {ll_base - ll_enh:+.4f}, Brier: {bs_base - bs_enh:+.4f}")
     else:
         logger.warning("  Team features not found in data. Run 01_fetch_pbp_data.py to regenerate.")
+
+    # --- Full model (with net rating + pace) ---
+    has_extended = all(c in reg.columns for c in EXTENDED_FEATURE_COLS)
+    full_model = None
+    full_features = None
+
+    if has_extended:
+        logger.info("Building FULL logistic model (+ net rating, pace)...")
+
+        full_data = reg.copy()
+
+        full_features = base_features + EXTENDED_FEATURE_COLS + [
+            "strength_x_time",
+            "margin_x_strength",
+            "net_rating_x_time",    # net rating matters more early in the game
+            "margin_x_net_rating",  # a 5-pt lead by a +10 team means more
+            "pace_normalized",      # pace relative to league average
+        ]
+        full_data["strength_x_time"] = full_data["strength_diff"] * full_data["time_fraction"]
+        full_data["margin_x_strength"] = full_data["home_margin"] * full_data["strength_diff"]
+        full_data["net_rating_x_time"] = full_data["net_rating_diff"] * full_data["time_fraction"]
+        full_data["margin_x_net_rating"] = full_data["home_margin"] * full_data["net_rating_diff"]
+        full_data["pace_normalized"] = full_data["expected_pace"] / 210.0 - 1.0  # centered around 0
+
+        X_full = full_data[full_features].values
+        y_full = full_data["home_win"].values
+
+        full_model = Pipeline([
+            ("poly", PolynomialFeatures(degree=2, include_bias=False)),
+            ("scaler", StandardScaler()),
+            ("lr", LogisticRegression(max_iter=5000, C=1.0)),
+        ])
+        full_model.fit(X_full, y_full)
+
+        y_pred_full = full_model.predict_proba(X_full)[:, 1]
+        ll_full = log_loss(y_full, y_pred_full)
+        bs_full = brier_score_loss(y_full, y_pred_full)
+        logger.info(f"  Full — Log loss: {ll_full:.4f}, Brier score: {bs_full:.4f}")
+        logger.info(f"  Improvement over baseline — Log loss: {ll_base - ll_full:+.4f}, Brier: {bs_base - bs_full:+.4f}")
+        if enhanced:
+            logger.info(f"  Improvement over enhanced — Log loss: {ll_enh - ll_full:+.4f}, Brier: {bs_enh - bs_full:+.4f}")
+    else:
+        logger.warning("  Extended features (net rating, pace) not found. Re-run 01_fetch_pbp_data.py.")
 
     return {
         "baseline": baseline,
         "enhanced": enhanced,
+        "full": full_model,
         "base_features": base_features,
-        "enhanced_features": enhanced_features if enhanced else None,
+        "enhanced_features": enhanced_features,
+        "full_features": full_features,
     }
 
 
@@ -266,28 +317,62 @@ def predict_from_model(
     home_home_win_pct: float = None,
     home_last10: float = None,
     away_last10: float = None,
+    home_net_rating: float = None,
+    away_net_rating: float = None,
+    home_pace: float = None,
+    away_pace: float = None,
+    model_tier: str = "best",
 ) -> float:
     """
-    Get win probability. Uses enhanced model if team features are provided,
-    otherwise falls back to baseline.
+    Get win probability. Uses the best available model based on provided features.
+
+    model_tier: "baseline", "enhanced", "full", or "best" (auto-select)
     """
     time_frac = seconds_remaining / 2880
 
-    use_enhanced = (
-        models.get("enhanced") is not None
-        and home_win_pct is not None
-        and away_win_pct is not None
-    )
+    # Fill defaults
+    if home_home_win_pct is None:
+        home_home_win_pct = home_win_pct if home_win_pct is not None else 0.5
+    if home_last10 is None:
+        home_last10 = home_win_pct if home_win_pct is not None else 0.5
+    if away_last10 is None:
+        away_last10 = away_win_pct if away_win_pct is not None else 0.5
 
-    if use_enhanced:
+    has_team = home_win_pct is not None and away_win_pct is not None
+    has_extended = has_team and home_net_rating is not None and away_net_rating is not None
+
+    # Auto-select best available model
+    if model_tier == "best":
+        if has_extended and models.get("full") is not None:
+            model_tier = "full"
+        elif has_team and models.get("enhanced") is not None:
+            model_tier = "enhanced"
+        else:
+            model_tier = "baseline"
+
+    if model_tier == "full" and models.get("full") is not None and has_extended:
         strength_diff = home_win_pct - away_win_pct
-        if home_home_win_pct is None:
-            home_home_win_pct = home_win_pct
-        if home_last10 is None:
-            home_last10 = home_win_pct
-        if away_last10 is None:
-            away_last10 = away_win_pct
+        net_rating_diff = home_net_rating - away_net_rating
+        h_pace = home_pace if home_pace is not None else 210.0
+        a_pace = away_pace if away_pace is not None else 210.0
+        expected_pace = (h_pace + a_pace) / 2
 
+        X = np.array([[
+            margin, time_frac, margin * time_frac,
+            home_win_pct, away_win_pct, home_home_win_pct,
+            home_last10, away_last10, strength_diff,
+            home_net_rating, away_net_rating, net_rating_diff,
+            h_pace, a_pace, expected_pace,
+            strength_diff * time_frac,
+            margin * strength_diff,
+            net_rating_diff * time_frac,
+            margin * net_rating_diff,
+            expected_pace / 210.0 - 1.0,
+        ]])
+        return float(models["full"].predict_proba(X)[0, 1])
+
+    elif model_tier == "enhanced" and models.get("enhanced") is not None and has_team:
+        strength_diff = home_win_pct - away_win_pct
         X = np.array([[
             margin, time_frac, margin * time_frac,
             home_win_pct, away_win_pct, home_home_win_pct,
@@ -296,6 +381,7 @@ def predict_from_model(
             margin * strength_diff,
         ]])
         return float(models["enhanced"].predict_proba(X)[0, 1])
+
     else:
         X = np.array([[margin, time_frac, margin * time_frac]])
         return float(models["baseline"].predict_proba(X)[0, 1])
@@ -393,34 +479,53 @@ def main():
             pickle.dump(models, f)
         logger.info(f"Saved models → {model_path}")
 
-        # Print sample predictions comparing baseline vs enhanced
-        logger.info("\nSample predictions:")
-        logger.info(f"  {'Scenario':40s} {'Baseline':>10s} {'Enhanced':>10s}")
-        logger.info(f"  {'—'*40} {'—'*10} {'—'*10}")
+        # Print sample predictions comparing all models
+        has_full = models.get("full") is not None
+        header = f"  {'Scenario':40s} {'Baseline':>10s} {'Enhanced':>10s}"
+        divider = f"  {'—'*40} {'—'*10} {'—'*10}"
+        if has_full:
+            header += f" {'Full':>10s}"
+            divider += f" {'—'*10}"
 
+        logger.info("\nSample predictions:")
+        logger.info(header)
+        logger.info(divider)
+
+        # (margin, secs, label, home_wpct, away_wpct, home_home_wpct, h_l10, a_l10, h_nrt, a_nrt, h_pace, a_pace)
         test_cases = [
-            # (margin, secs, label, home_wpct, away_wpct, home_home_wpct, h_l10, a_l10)
-            (0, 2880, "Tip-off, tied (even teams)", 0.50, 0.50, 0.55, 0.50, 0.50),
-            (0, 2880, "Tip-off, 70% team hosting 30%", 0.70, 0.30, 0.80, 0.70, 0.30),
-            (0, 2880, "Tip-off, 30% team hosting 70%", 0.30, 0.70, 0.35, 0.30, 0.70),
-            (5, 1440, "Up 5, halftime (even)", 0.50, 0.50, 0.55, 0.50, 0.50),
-            (5, 1440, "Up 5, halftime (fav hosting)", 0.65, 0.40, 0.70, 0.70, 0.40),
-            (-5, 1440, "Down 5, halftime (fav hosting)", 0.65, 0.40, 0.70, 0.70, 0.40),
-            (2, 480, "Up 2, 8 min left (even)", 0.50, 0.50, 0.55, 0.50, 0.50),
-            (2, 480, "Up 2, 8 min (hot team)", 0.55, 0.45, 0.60, 0.90, 0.30),
-            (-2, 480, "Down 2, 8 min (hot team)", 0.55, 0.45, 0.60, 0.90, 0.30),
-            (10, 300, "Up 10, 5 min left", 0.50, 0.50, 0.55, 0.50, 0.50),
-            (3, 60, "Up 3, 1 min left", 0.50, 0.50, 0.55, 0.50, 0.50),
-            (-3, 60, "Down 3, 1 min left", 0.50, 0.50, 0.55, 0.50, 0.50),
+            (0, 2880, "Tip-off, even teams", 0.50, 0.50, 0.55, 0.50, 0.50, 0.0, 0.0, 210, 210),
+            (0, 2880, "Tip-off, 70% hosts 30%", 0.70, 0.30, 0.80, 0.70, 0.30, 6.0, -6.0, 215, 205),
+            (0, 2880, "Tip-off, 30% hosts 70%", 0.30, 0.70, 0.35, 0.30, 0.70, -6.0, 6.0, 205, 215),
+            (5, 1440, "Up 5, half (even)", 0.50, 0.50, 0.55, 0.50, 0.50, 0.0, 0.0, 210, 210),
+            (5, 1440, "Up 5, half (fav hosting)", 0.65, 0.40, 0.70, 0.70, 0.40, 5.0, -3.0, 220, 208),
+            (-5, 1440, "Down 5, half (fav hosting)", 0.65, 0.40, 0.70, 0.70, 0.40, 5.0, -3.0, 220, 208),
+            (2, 480, "Up 2, 8m left (even)", 0.50, 0.50, 0.55, 0.50, 0.50, 0.0, 0.0, 210, 210),
+            (2, 480, "Up 2, 8m (fast pace)", 0.55, 0.45, 0.60, 0.90, 0.30, 3.0, -1.0, 230, 225),
+            (-2, 480, "Down 2, 8m (fast pace)", 0.55, 0.45, 0.60, 0.90, 0.30, 3.0, -1.0, 230, 225),
+            (10, 300, "Up 10, 5 min left", 0.50, 0.50, 0.55, 0.50, 0.50, 0.0, 0.0, 210, 210),
+            (3, 60, "Up 3, 1 min left", 0.50, 0.50, 0.55, 0.50, 0.50, 0.0, 0.0, 210, 210),
+            (-3, 60, "Down 3, 1 min left", 0.50, 0.50, 0.55, 0.50, 0.50, 0.0, 0.0, 210, 210),
         ]
-        for margin, secs, label, h_wp, a_wp, h_hwp, h_l10, a_l10 in test_cases:
-            base = predict_from_model(models, margin, secs)
+        for margin, secs, label, h_wp, a_wp, h_hwp, h_l10, a_l10, h_nrt, a_nrt, h_pace, a_pace in test_cases:
+            base = predict_from_model(models, margin, secs, model_tier="baseline")
             enh = predict_from_model(
                 models, margin, secs,
                 home_win_pct=h_wp, away_win_pct=a_wp,
                 home_home_win_pct=h_hwp, home_last10=h_l10, away_last10=a_l10,
+                model_tier="enhanced",
             )
-            logger.info(f"  {label:40s} {base:9.1%} {enh:9.1%}")
+            line = f"  {label:40s} {base:9.1%} {enh:9.1%}"
+            if has_full:
+                full = predict_from_model(
+                    models, margin, secs,
+                    home_win_pct=h_wp, away_win_pct=a_wp,
+                    home_home_win_pct=h_hwp, home_last10=h_l10, away_last10=a_l10,
+                    home_net_rating=h_nrt, away_net_rating=a_nrt,
+                    home_pace=h_pace, away_pace=a_pace,
+                    model_tier="full",
+                )
+                line += f" {full:9.1%}"
+            logger.info(line)
 
     logger.success("Model building complete!")
 

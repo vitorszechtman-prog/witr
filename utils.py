@@ -75,6 +75,48 @@ def kalshi_login(session) -> str:
     return token
 
 
+# ── NBA Team Mapping ──────────────────────────────────────────────────────
+# tricode → list of name variants used in Kalshi titles and NBA data
+NBA_TEAM_NAMES = {
+    "ATL": ["Hawks", "Atlanta"],
+    "BOS": ["Celtics", "Boston"],
+    "BKN": ["Nets", "Brooklyn"],
+    "CHA": ["Hornets", "Charlotte"],
+    "CHI": ["Bulls", "Chicago"],
+    "CLE": ["Cavaliers", "Cavs", "Cleveland"],
+    "DAL": ["Mavericks", "Mavs", "Dallas"],
+    "DEN": ["Nuggets", "Denver"],
+    "DET": ["Pistons", "Detroit"],
+    "GSW": ["Warriors", "Golden State"],
+    "HOU": ["Rockets", "Houston"],
+    "IND": ["Pacers", "Indiana"],
+    "LAC": ["Clippers", "LA Clippers"],
+    "LAL": ["Lakers", "LA Lakers", "Los Angeles Lakers"],
+    "MEM": ["Grizzlies", "Memphis"],
+    "MIA": ["Heat", "Miami"],
+    "MIL": ["Bucks", "Milwaukee"],
+    "MIN": ["Timberwolves", "Wolves", "Minnesota"],
+    "NOP": ["Pelicans", "New Orleans"],
+    "NYK": ["Knicks", "New York"],
+    "OKC": ["Thunder", "Oklahoma City", "OKC"],
+    "ORL": ["Magic", "Orlando"],
+    "PHI": ["76ers", "Sixers", "Philadelphia"],
+    "PHX": ["Suns", "Phoenix"],
+    "POR": ["Trail Blazers", "Blazers", "Portland"],
+    "SAC": ["Kings", "Sacramento"],
+    "SAS": ["Spurs", "San Antonio"],
+    "TOR": ["Raptors", "Toronto"],
+    "UTA": ["Jazz", "Utah"],
+    "WAS": ["Wizards", "Washington"],
+}
+
+# Reverse lookup: name variant → tricode
+TEAM_NAME_TO_TRICODE = {}
+for _tc, _names in NBA_TEAM_NAMES.items():
+    for _n in _names:
+        TEAM_NAME_TO_TRICODE[_n.upper()] = _tc
+    TEAM_NAME_TO_TRICODE[_tc] = _tc
+
 # ── NBA Utilities ──────────────────────────────────────────────────────────
 
 def seconds_remaining_in_game(period: int, period_clock: str) -> int:

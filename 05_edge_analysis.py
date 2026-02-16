@@ -8,10 +8,13 @@ This script:
 2. Looks up model fair value for each game state
 3. Computes edge = model_prob - kalshi_price
 4. Analyzes: How often is there edge? How large? Would trading it be profitable?
+5. Kelly criterion sizing for optimal bet allocation
+6. Team-aware market matching (maps Kalshi tickers to specific NBA games)
 
 Usage:
-    python scripts/05_edge_analysis.py
-    python scripts/05_edge_analysis.py --threshold 5 --visualize
+    python 05_edge_analysis.py
+    python 05_edge_analysis.py --threshold 5 --visualize
+    python 05_edge_analysis.py --kelly --bankroll 1000
 
 Output:
     analysis/edge_distribution.png
@@ -29,7 +32,7 @@ import pandas as pd
 from loguru import logger
 
 sys.path.append(str(Path(__file__).parent))
-from utils import DATA_DIR, PROJECT_ROOT, read_jsonl
+from utils import DATA_DIR, PROJECT_ROOT, read_jsonl, TEAM_NAME_TO_TRICODE
 
 
 def load_kalshi_prices() -> pd.DataFrame:
@@ -111,41 +114,109 @@ def model_fair_value(model, margin: int, seconds_remaining: int) -> float:
     return float(model.predict_proba(X)[0, 1])
 
 
+def extract_teams_from_kalshi(row: pd.Series) -> tuple[str, str] | None:
+    """Extract team tricodes from a Kalshi market row."""
+    # Check if already annotated
+    if "home_team" in row and pd.notna(row.get("home_team")):
+        return (str(row["home_team"]), str(row.get("away_team", "")))
+
+    search_text = f"{row.get('title', '')} {row.get('ticker', '')}".upper()
+
+    matched = []
+    for name, tricode in TEAM_NAME_TO_TRICODE.items():
+        if name in search_text and tricode not in matched:
+            matched.append(tricode)
+
+    if len(matched) >= 2:
+        return (matched[0], matched[1])
+    return None
+
+
 def merge_kalshi_and_game_state(
     kalshi_df: pd.DataFrame,
     game_state_df: pd.DataFrame,
     max_time_diff_sec: int = 15,
 ) -> pd.DataFrame:
     """
-    Merge Kalshi prices with NBA game states by closest timestamp.
-    
-    This is an approximate merge — we match each Kalshi snapshot with
-    the nearest game-state snapshot within max_time_diff_sec.
+    Merge Kalshi prices with NBA game states by timestamp + team matching.
+
+    Two-pass strategy:
+    1. If Kalshi markets have team annotations, merge by team + closest timestamp
+    2. Fallback: merge by closest timestamp only (for single-game windows)
     """
     logger.info("Merging Kalshi prices with game states...")
-    
-    # For each Kalshi record, we need to figure out which NBA game it maps to.
-    # This requires some heuristic matching based on team names in the market title.
-    # For now, we do a simple timestamp-based merge assuming one game at a time.
-    
-    # Sort both by timestamp
+
     kalshi_df = kalshi_df.sort_values("timestamp").copy()
     game_state_df = game_state_df.sort_values("timestamp").copy()
-    
-    merged = pd.merge_asof(
-        kalshi_df,
-        game_state_df,
-        on="timestamp",
-        tolerance=pd.Timedelta(seconds=max_time_diff_sec),
-        direction="nearest",
-        suffixes=("_kalshi", "_nba"),
-    )
-    
-    # Drop rows where merge failed
-    before = len(merged)
-    merged = merged.dropna(subset=["home_margin", "seconds_remaining"])
-    logger.info(f"  Merged: {len(merged):,} / {before:,} rows matched")
-    
+
+    # Try to extract teams from Kalshi data
+    kalshi_df["_extracted_teams"] = kalshi_df.apply(extract_teams_from_kalshi, axis=1)
+    has_teams = kalshi_df["_extracted_teams"].notna()
+
+    merged_parts = []
+
+    # Pass 1: Team-aware merge
+    if has_teams.any():
+        team_kalshi = kalshi_df[has_teams].copy()
+        # For each Kalshi row with team info, find the matching NBA game
+        matched_rows = []
+        for _, krow in team_kalshi.iterrows():
+            teams = krow["_extracted_teams"]
+            ts = krow["timestamp"]
+
+            # Find NBA game state for these teams near this timestamp
+            team_mask = (
+                (game_state_df["home_team"].isin(teams))
+                & (game_state_df["away_team"].isin(teams))
+            )
+            candidates = game_state_df[team_mask]
+            if len(candidates) == 0:
+                continue
+
+            # Find nearest timestamp
+            time_diffs = (candidates["timestamp"] - ts).abs()
+            nearest_idx = time_diffs.idxmin()
+            if time_diffs[nearest_idx].total_seconds() > max_time_diff_sec:
+                continue
+
+            nba_row = candidates.loc[nearest_idx]
+            merged_row = {**krow.to_dict(), **{f"{k}_nba": v for k, v in nba_row.to_dict().items()}}
+            # Use NBA data directly for key fields
+            merged_row["home_margin"] = nba_row["home_margin"]
+            merged_row["seconds_remaining"] = nba_row["seconds_remaining"]
+            merged_row["home_team_matched"] = nba_row["home_team"]
+            merged_row["away_team_matched"] = nba_row["away_team"]
+            matched_rows.append(merged_row)
+
+        if matched_rows:
+            team_merged = pd.DataFrame(matched_rows)
+            merged_parts.append(team_merged)
+            logger.info(f"  Team-aware merge: {len(team_merged):,} rows")
+
+    # Pass 2: Timestamp-only merge for unmatched rows
+    unmatched_kalshi = kalshi_df[~has_teams] if has_teams.any() else kalshi_df
+    if len(unmatched_kalshi) > 0:
+        ts_merged = pd.merge_asof(
+            unmatched_kalshi,
+            game_state_df,
+            on="timestamp",
+            tolerance=pd.Timedelta(seconds=max_time_diff_sec),
+            direction="nearest",
+            suffixes=("_kalshi", "_nba"),
+        )
+        ts_merged = ts_merged.dropna(subset=["home_margin", "seconds_remaining"])
+        if len(ts_merged) > 0:
+            merged_parts.append(ts_merged)
+            logger.info(f"  Timestamp-only merge: {len(ts_merged):,} rows")
+
+    if not merged_parts:
+        logger.warning("  No rows merged!")
+        return pd.DataFrame()
+
+    merged = pd.concat(merged_parts, ignore_index=True)
+    merged.drop(columns=["_extracted_teams"], errors="ignore", inplace=True)
+    logger.info(f"  Total merged: {len(merged):,} rows")
+
     return merged
 
 
@@ -277,45 +348,111 @@ def analyze_edge(edges_df: pd.DataFrame, threshold_cents: float = 5.0):
     return edges_df
 
 
+def kelly_fraction(edge: float, odds: float) -> float:
+    """
+    Compute Kelly criterion fraction for a binary bet.
+
+    For a binary market at price p (implied probability):
+        - If we think true prob is q, edge = q - p
+        - Odds of YES contract: payout = 1/p, cost = p → net odds = (1-p)/p
+        - Kelly fraction f* = (q * (1-p)/p - (1-q)) / ((1-p)/p)
+                            = (q - p) / (1 - p)  [for YES bets]
+        - For NO bets: f* = (p - q) / p
+
+    Returns fraction of bankroll to bet (0 = no bet, capped at 0.25).
+    """
+    if edge > 0:
+        # Buy YES: model says underpriced
+        p = odds  # market price
+        q = odds + edge  # our probability
+        if p >= 1.0 or p <= 0.0:
+            return 0.0
+        f = (q - p) / (1 - p)
+    else:
+        # Buy NO: model says overpriced
+        p = odds
+        q = odds + edge  # our probability (lower than market)
+        if p >= 1.0 or p <= 0.0:
+            return 0.0
+        f = (p - q) / p
+
+    # Half-Kelly for safety, cap at 25%
+    f = max(0.0, f) * 0.5
+    return min(f, 0.25)
+
+
 def simulate_pnl(
     edges_df: pd.DataFrame,
     threshold_cents: float = 5.0,
-    bet_size: float = 10.0,  # dollars per trade
+    bet_size: float = 10.0,  # dollars per trade (flat sizing)
+    bankroll: float = None,  # if set, use Kelly sizing
 ):
     """
-    Simple PnL simulation: trade every time |edge| > threshold.
-    Buy YES if edge > 0 (model says underpriced), buy NO if edge < 0.
-    
+    PnL simulation with flat sizing and optional Kelly criterion.
+
+    Two modes:
+    1. Flat: bet fixed $ per trade when |edge| > threshold
+    2. Kelly: bet Kelly-optimal fraction of bankroll per trade
+
     NOTE: This is a rough simulation. Real PnL depends on:
     - Execution at bid/ask (not mid)
     - Timing of entry and exit
-    - Kalshi fees
+    - Kalshi fees (typically ~2% on profits)
     - Contract resolution
     """
     threshold = threshold_cents / 100.0
-    
+
     trades = edges_df[edges_df["abs_edge"] >= threshold].copy()
-    
+
     if len(trades) == 0:
         logger.info("No trades triggered at this threshold")
-        return
-    
-    # For each trade, theoretical profit = edge * bet_size
-    # (This assumes you can exit at fair value, which is optimistic)
+        return None
+
+    # Flat sizing
     trades["theoretical_pnl"] = trades["edge"] * bet_size
-    
-    # More conservative: assume you capture half the edge
     trades["conservative_pnl"] = trades["edge"] * bet_size * 0.5
-    
+
     logger.info(f"\n{'='*60}")
-    logger.info("SIMPLE PnL SIMULATION")
+    logger.info("PnL SIMULATION — FLAT SIZING")
     logger.info(f"{'='*60}")
     logger.info(f"Threshold: {threshold_cents:.0f}¢ | Bet size: ${bet_size:.0f}")
     logger.info(f"Total trades: {len(trades):,}")
     logger.info(f"Theoretical total PnL: ${trades['theoretical_pnl'].sum():.2f}")
     logger.info(f"Conservative total PnL: ${trades['conservative_pnl'].sum():.2f}")
     logger.info(f"Avg PnL per trade: ${trades['conservative_pnl'].mean():.4f}")
-    
+
+    # Kelly sizing
+    if bankroll is not None and bankroll > 0:
+        logger.info(f"\n{'='*60}")
+        logger.info("PnL SIMULATION — KELLY CRITERION")
+        logger.info(f"{'='*60}")
+        logger.info(f"Starting bankroll: ${bankroll:.0f}")
+
+        trades["kelly_f"] = trades.apply(
+            lambda r: kelly_fraction(r["edge"], r["kalshi_prob"]), axis=1
+        )
+        trades["kelly_bet"] = trades["kelly_f"] * bankroll
+        trades["kelly_pnl"] = trades["edge"] * trades["kelly_bet"] * 0.5  # conservative
+
+        # Simulate sequential growth
+        running_bankroll = bankroll
+        bankroll_history = [bankroll]
+        for _, trade in trades.iterrows():
+            f = kelly_fraction(trade["edge"], trade["kalshi_prob"])
+            size = f * running_bankroll
+            pnl = trade["edge"] * size * 0.5  # conservative capture
+            running_bankroll += pnl
+            bankroll_history.append(running_bankroll)
+
+        trades["cumulative_kelly_pnl"] = trades["kelly_pnl"].cumsum()
+
+        logger.info(f"Total Kelly trades: {len(trades):,}")
+        logger.info(f"Avg Kelly fraction: {trades['kelly_f'].mean():.2%}")
+        logger.info(f"Max Kelly fraction: {trades['kelly_f'].max():.2%}")
+        logger.info(f"Total Kelly PnL: ${trades['kelly_pnl'].sum():.2f}")
+        logger.info(f"Final bankroll (sequential): ${running_bankroll:.2f}")
+        logger.info(f"Return: {(running_bankroll / bankroll - 1):.1%}")
+
     return trades
 
 
@@ -382,6 +519,13 @@ def main():
         "--threshold", type=float, default=5.0, help="Edge threshold in cents"
     )
     parser.add_argument("--visualize", action="store_true")
+    parser.add_argument(
+        "--kelly", action="store_true", help="Run Kelly criterion sizing simulation"
+    )
+    parser.add_argument(
+        "--bankroll", type=float, default=1000.0,
+        help="Starting bankroll for Kelly simulation (default: $1000)",
+    )
     args = parser.parse_args()
 
     # Load data
@@ -393,18 +537,30 @@ def main():
     # Merge
     merged = merge_kalshi_and_game_state(kalshi_df, game_state_df)
 
+    if len(merged) == 0:
+        logger.error("No merged data available. Need both Kalshi and NBA game logs.")
+        sys.exit(1)
+
     # Compute edge
     edges_df = compute_edge(merged, table, model)
 
     # Analyze
     analyze_edge(edges_df, threshold_cents=args.threshold)
-    simulate_pnl(edges_df, threshold_cents=args.threshold)
+    trades = simulate_pnl(
+        edges_df,
+        threshold_cents=args.threshold,
+        bankroll=args.bankroll if args.kelly else None,
+    )
 
     # Save
     analysis_dir = PROJECT_ROOT / "analysis"
     analysis_dir.mkdir(exist_ok=True)
     edges_df.to_csv(analysis_dir / "edge_data.csv", index=False)
     logger.info(f"Saved edge data → {analysis_dir / 'edge_data.csv'}")
+
+    if trades is not None:
+        trades.to_csv(analysis_dir / "trades.csv", index=False)
+        logger.info(f"Saved trades → {analysis_dir / 'trades.csv'}")
 
     if args.visualize:
         visualize_edge(edges_df, analysis_dir)

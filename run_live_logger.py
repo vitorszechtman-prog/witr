@@ -5,8 +5,10 @@ Combined launcher: runs both the Kalshi price logger and NBA game state
 logger in parallel threads, so data is synchronized by timestamp.
 
 Usage:
-    python scripts/run_live_logger.py
-    python scripts/run_live_logger.py --interval 10 --dry-run
+    python run_live_logger.py                        # full pipeline
+    python run_live_logger.py --interval 10 --dry-run
+    python run_live_logger.py --nba-only --with-model  # NBA + win prob, no Kalshi
+    python run_live_logger.py --kalshi-ws             # use WebSocket for Kalshi
 
 This is the main script to run during live NBA games to build your database.
 """
@@ -21,28 +23,29 @@ from loguru import logger
 sys.path.append(str(Path(__file__).parent))
 
 
-def run_nba_logger(interval: int, dry_run: bool):
+def run_nba_logger(interval: int, dry_run: bool, with_model: bool):
     """Thread target for NBA game state logging."""
-    from nba_live_game_state_04 import run_game_state_logger
-    # Rename to avoid import issues — or just import directly
     import importlib
     mod = importlib.import_module("04_nba_live_game_state")
-    mod.run_game_state_logger(interval=interval, dry_run=dry_run)
+    mod.run_game_state_logger(interval=interval, dry_run=dry_run, with_model=with_model)
 
 
-def run_kalshi_logger(interval: int, dry_run: bool):
+def run_kalshi_logger(interval: int, dry_run: bool, use_ws: bool):
     """Thread target for Kalshi price logging."""
     import importlib
     mod = importlib.import_module("03_kalshi_live_logger")
-    
+
     client = mod.KalshiClient()
     try:
         client.login_from_env()
     except ValueError as e:
         logger.error(f"Kalshi login failed: {e}")
         return
-    
-    mod.run_logger(client, interval=interval, dry_run=dry_run)
+
+    if use_ws:
+        mod.run_ws_logger(client, dry_run=dry_run)
+    else:
+        mod.run_logger(client, interval=interval, dry_run=dry_run)
 
 
 def main():
@@ -55,13 +58,23 @@ def main():
         "--nba-only", action="store_true",
         help="Only run NBA game state logger (no Kalshi credentials needed)"
     )
+    parser.add_argument(
+        "--with-model", action="store_true",
+        help="Include live win probability predictions in NBA logger"
+    )
+    parser.add_argument(
+        "--kalshi-ws", action="store_true",
+        help="Use WebSocket streaming for Kalshi (lower latency)"
+    )
     args = parser.parse_args()
 
     logger.info("=" * 60)
-    logger.info("KALSHI NBA LIVE LOGGER")
+    logger.info("WITR — LIVE GAME LOGGER")
     logger.info("=" * 60)
     logger.info(f"Poll interval: {args.interval}s")
     logger.info(f"Dry run: {args.dry_run}")
+    logger.info(f"Model predictions: {args.with_model}")
+    logger.info(f"Kalshi mode: {'WebSocket' if args.kalshi_ws else 'REST polling'}")
     logger.info("Press Ctrl+C to stop\n")
 
     threads = []
@@ -69,7 +82,7 @@ def main():
     # Always run NBA logger
     nba_thread = threading.Thread(
         target=run_nba_logger,
-        args=(args.interval, args.dry_run),
+        args=(args.interval, args.dry_run, args.with_model),
         daemon=True,
         name="nba-logger",
     )
@@ -78,18 +91,16 @@ def main():
     if not args.nba_only:
         kalshi_thread = threading.Thread(
             target=run_kalshi_logger,
-            args=(args.interval, args.dry_run),
+            args=(args.interval, args.dry_run, args.kalshi_ws),
             daemon=True,
             name="kalshi-logger",
         )
         threads.append(kalshi_thread)
 
-    # Start all threads
     for t in threads:
         logger.info(f"Starting {t.name}...")
         t.start()
 
-    # Wait for threads (Ctrl+C will exit)
     try:
         for t in threads:
             t.join()

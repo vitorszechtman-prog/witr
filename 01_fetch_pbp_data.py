@@ -173,6 +173,9 @@ def compute_team_features(outcomes_df: pd.DataFrame) -> pd.DataFrame:
     - home_last10 / away_last10: win rate over last 10 games
     - home_home_win_pct: this team's home-specific win percentage
     - strength_diff: home_win_pct - away_win_pct (positive = home team is stronger)
+    - home_net_rating / away_net_rating: avg point differential per game (proxy for net rating)
+    - home_pace / away_pace: avg total points per game (proxy for pace)
+    - net_rating_diff: home_net_rating - away_net_rating
 
     All features reflect the state BEFORE the game is played.
     """
@@ -183,12 +186,20 @@ def compute_team_features(outcomes_df: pd.DataFrame) -> pd.DataFrame:
     team_home_wins = defaultdict(int)
     team_home_games = defaultdict(int)
     team_last10 = defaultdict(list)
+    # Net rating: running sum of point differentials
+    team_pts_for = defaultdict(int)
+    team_pts_against = defaultdict(int)
+    team_games_played = defaultdict(int)
+    # Pace: running sum of total game points (team's games)
+    team_total_pts = defaultdict(list)  # list of (pts_for + pts_against) per game
 
     records = []
     for _, game in games.iterrows():
         ht = game["home_team"]
         at = game["away_team"]
         hw = int(game["home_win"])
+        h_pts = int(game["home_pts"])
+        a_pts = int(game["away_pts"])
 
         # Going-in features
         h_gp = team_wins[ht] + team_losses[ht]
@@ -204,6 +215,14 @@ def compute_team_features(outcomes_df: pd.DataFrame) -> pd.DataFrame:
         h_last10_wpct = sum(h_l10) / len(h_l10) if h_l10 else 0.5
         a_last10_wpct = sum(a_l10) / len(a_l10) if a_l10 else 0.5
 
+        # Net rating (avg point differential)
+        h_net = (team_pts_for[ht] - team_pts_against[ht]) / max(1, team_games_played[ht])
+        a_net = (team_pts_for[at] - team_pts_against[at]) / max(1, team_games_played[at])
+
+        # Pace proxy (avg total game points)
+        h_pace = np.mean(team_total_pts[ht][-20:]) if team_total_pts[ht] else 210.0
+        a_pace = np.mean(team_total_pts[at][-20:]) if team_total_pts[at] else 210.0
+
         records.append({
             "game_id": game["game_id"],
             "home_win_pct": round(h_wpct, 4),
@@ -212,6 +231,12 @@ def compute_team_features(outcomes_df: pd.DataFrame) -> pd.DataFrame:
             "home_last10": round(h_last10_wpct, 4),
             "away_last10": round(a_last10_wpct, 4),
             "strength_diff": round(h_wpct - a_wpct, 4),
+            "home_net_rating": round(h_net, 2),
+            "away_net_rating": round(a_net, 2),
+            "net_rating_diff": round(h_net - a_net, 2),
+            "home_pace": round(h_pace, 1),
+            "away_pace": round(a_pace, 1),
+            "expected_pace": round((h_pace + a_pace) / 2, 1),
         })
 
         # Update trackers AFTER recording going-in features
@@ -228,6 +253,17 @@ def compute_team_features(outcomes_df: pd.DataFrame) -> pd.DataFrame:
 
         team_last10[ht].append(hw)
         team_last10[at].append(1 - hw)
+
+        # Update net rating and pace trackers
+        team_pts_for[ht] += h_pts
+        team_pts_against[ht] += a_pts
+        team_pts_for[at] += a_pts
+        team_pts_against[at] += h_pts
+        team_games_played[ht] += 1
+        team_games_played[at] += 1
+        game_total = h_pts + a_pts
+        team_total_pts[ht].append(game_total)
+        team_total_pts[at].append(game_total)
 
     return pd.DataFrame(records)
 
