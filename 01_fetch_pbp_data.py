@@ -21,6 +21,7 @@ Output:
 import argparse
 import subprocess
 import sys
+from collections import defaultdict
 from pathlib import Path
 
 import pandas as pd
@@ -134,10 +135,19 @@ def process_season(season_year: int, sample: int | None = None):
         if (idx + 1) % 200 == 0:
             logger.info(f"  Processed {idx + 1}/{len(game_ids)} games ({len(all_states):,} states)...")
 
-    # Save outputs
+    # Build DataFrames
     states_df = pd.DataFrame(all_states)
     outcomes_df = pd.DataFrame(all_outcomes)
 
+    # Compute team features (standings, L10, team-specific HCA)
+    logger.info("  Computing team performance features...")
+    team_features = compute_team_features(outcomes_df)
+    outcomes_df = outcomes_df.merge(team_features, on="game_id", how="left")
+
+    # Merge team features into game states (join on game_id)
+    states_df = states_df.merge(team_features, on="game_id", how="left")
+
+    # Save outputs
     states_path = DATA_DIR / f"game_states_{season_year}.parquet"
     outcomes_path = DATA_DIR / f"game_outcomes_{season_year}.parquet"
 
@@ -154,6 +164,72 @@ def process_season(season_year: int, sample: int | None = None):
     logger.info(f"  Home win%: {home_win_pct:.1%}, Avg home margin: {avg_margin:+.1f}")
 
     return states_df
+
+
+def compute_team_features(outcomes_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    For each game (processed chronologically), compute going-in team features:
+    - home_win_pct / away_win_pct: season-to-date win percentage
+    - home_last10 / away_last10: win rate over last 10 games
+    - home_home_win_pct: this team's home-specific win percentage
+    - strength_diff: home_win_pct - away_win_pct (positive = home team is stronger)
+
+    All features reflect the state BEFORE the game is played.
+    """
+    games = outcomes_df.sort_values("game_id").reset_index(drop=True)
+
+    team_wins = defaultdict(int)
+    team_losses = defaultdict(int)
+    team_home_wins = defaultdict(int)
+    team_home_games = defaultdict(int)
+    team_last10 = defaultdict(list)
+
+    records = []
+    for _, game in games.iterrows():
+        ht = game["home_team"]
+        at = game["away_team"]
+        hw = int(game["home_win"])
+
+        # Going-in features
+        h_gp = team_wins[ht] + team_losses[ht]
+        a_gp = team_wins[at] + team_losses[at]
+
+        h_wpct = team_wins[ht] / max(1, h_gp)
+        a_wpct = team_wins[at] / max(1, a_gp)
+
+        h_home_wpct = team_home_wins[ht] / max(1, team_home_games[ht])
+
+        h_l10 = team_last10[ht][-10:]
+        a_l10 = team_last10[at][-10:]
+        h_last10_wpct = sum(h_l10) / len(h_l10) if h_l10 else 0.5
+        a_last10_wpct = sum(a_l10) / len(a_l10) if a_l10 else 0.5
+
+        records.append({
+            "game_id": game["game_id"],
+            "home_win_pct": round(h_wpct, 4),
+            "away_win_pct": round(a_wpct, 4),
+            "home_home_win_pct": round(h_home_wpct, 4),
+            "home_last10": round(h_last10_wpct, 4),
+            "away_last10": round(a_last10_wpct, 4),
+            "strength_diff": round(h_wpct - a_wpct, 4),
+        })
+
+        # Update trackers AFTER recording going-in features
+        if hw:
+            team_wins[ht] += 1
+            team_losses[at] += 1
+        else:
+            team_losses[ht] += 1
+            team_wins[at] += 1
+
+        team_home_games[ht] += 1
+        if hw:
+            team_home_wins[ht] += 1
+
+        team_last10[ht].append(hw)
+        team_last10[at].append(1 - hw)
+
+    return pd.DataFrame(records)
 
 
 def extract_game_states(

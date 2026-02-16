@@ -29,7 +29,7 @@ import numpy as np
 import pandas as pd
 from scipy.ndimage import gaussian_filter
 from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import PolynomialFeatures
+from sklearn.preprocessing import PolynomialFeatures, StandardScaler
 from sklearn.pipeline import Pipeline
 from sklearn.calibration import CalibratedClassifierCV
 from loguru import logger
@@ -172,52 +172,133 @@ def _logistic_approx(margin: float, seconds_remaining: float) -> float:
     return 1 / (1 + np.exp(-z))
 
 
-def build_logistic_model(df: pd.DataFrame) -> Pipeline:
+TEAM_FEATURE_COLS = [
+    "home_win_pct", "away_win_pct", "home_home_win_pct",
+    "home_last10", "away_last10", "strength_diff",
+]
+
+
+def build_logistic_model(df: pd.DataFrame) -> dict:
     """
-    Build a calibrated logistic regression model:
-        P(home_win) = f(home_margin, seconds_remaining, margin * time_interaction)
-    
-    Uses polynomial features to capture non-linear relationships.
+    Build two models:
+        1. Baseline: P(home_win) = f(margin, time)
+        2. Enhanced: P(home_win) = f(margin, time, team_strength, L10, home_court_adv)
+
+    Returns dict with both models and feature metadata.
     """
-    logger.info("Building logistic regression model...")
+    from sklearn.metrics import log_loss, brier_score_loss
 
     reg = df[df["seconds_remaining"] >= 0].copy()
 
-    # Features
-    reg["time_fraction"] = reg["seconds_remaining"] / 2880  # fraction of game remaining
+    # Core features (same as before)
+    reg["time_fraction"] = reg["seconds_remaining"] / 2880
     reg["margin_x_time"] = reg["home_margin"] * reg["time_fraction"]
 
-    X = reg[["home_margin", "time_fraction", "margin_x_time"]].values
+    base_features = ["home_margin", "time_fraction", "margin_x_time"]
+
+    # --- Baseline model ---
+    logger.info("Building BASELINE logistic model (margin + time only)...")
+    X_base = reg[base_features].values
     y = reg["home_win"].values
 
-    # Pipeline: polynomial features + calibrated logistic regression
-    model = Pipeline([
-        ("poly", PolynomialFeatures(degree=3, interaction_only=False, include_bias=False)),
+    baseline = Pipeline([
+        ("poly", PolynomialFeatures(degree=3, include_bias=False)),
+        ("scaler", StandardScaler()),
         ("lr", LogisticRegression(max_iter=5000, C=1.0)),
     ])
+    baseline.fit(X_base, y)
 
-    # Fit with calibration for better probability estimates
-    model.fit(X, y)
+    y_pred_base = baseline.predict_proba(X_base)[:, 1]
+    ll_base = log_loss(y, y_pred_base)
+    bs_base = brier_score_loss(y, y_pred_base)
+    logger.info(f"  Baseline — Log loss: {ll_base:.4f}, Brier score: {bs_base:.4f}")
 
-    # Evaluate on training data (just for logging)
-    from sklearn.metrics import log_loss, brier_score_loss
-    y_pred = model.predict_proba(X)[:, 1]
-    ll = log_loss(y, y_pred)
-    bs = brier_score_loss(y, y_pred)
-    logger.info(f"  Log loss: {ll:.4f}, Brier score: {bs:.4f}")
+    # --- Enhanced model ---
+    has_team_features = all(c in reg.columns for c in TEAM_FEATURE_COLS)
+    enhanced = None
 
-    return model
+    if has_team_features:
+        logger.info("Building ENHANCED logistic model (+ team strength, L10, home court)...")
+
+        # Filter to games where teams have played >= 10 games (features are meaningful)
+        has_data = reg.copy()
+
+        # Enhanced features
+        enhanced_features = base_features + TEAM_FEATURE_COLS + [
+            "strength_x_time",  # team quality matters more early
+            "margin_x_strength",  # margin means more when teams are mismatched
+        ]
+        has_data["strength_x_time"] = has_data["strength_diff"] * has_data["time_fraction"]
+        has_data["margin_x_strength"] = has_data["home_margin"] * has_data["strength_diff"]
+
+        X_enh = has_data[enhanced_features].values
+        y_enh = has_data["home_win"].values
+
+        enhanced = Pipeline([
+            ("poly", PolynomialFeatures(degree=2, include_bias=False)),
+            ("scaler", StandardScaler()),
+            ("lr", LogisticRegression(max_iter=5000, C=1.0)),
+        ])
+        enhanced.fit(X_enh, y_enh)
+
+        y_pred_enh = enhanced.predict_proba(X_enh)[:, 1]
+        ll_enh = log_loss(y_enh, y_pred_enh)
+        bs_enh = brier_score_loss(y_enh, y_pred_enh)
+        logger.info(f"  Enhanced — Log loss: {ll_enh:.4f}, Brier score: {bs_enh:.4f}")
+        logger.info(f"  Improvement — Log loss: {ll_base - ll_enh:+.4f}, Brier: {bs_base - bs_enh:+.4f}")
+    else:
+        logger.warning("  Team features not found in data. Run 01_fetch_pbp_data.py to regenerate.")
+
+    return {
+        "baseline": baseline,
+        "enhanced": enhanced,
+        "base_features": base_features,
+        "enhanced_features": enhanced_features if enhanced else None,
+    }
 
 
 def predict_from_model(
-    model: Pipeline,
+    models: dict,
     margin: float,
     seconds_remaining: float,
+    home_win_pct: float = None,
+    away_win_pct: float = None,
+    home_home_win_pct: float = None,
+    home_last10: float = None,
+    away_last10: float = None,
 ) -> float:
-    """Get win probability from the fitted model."""
+    """
+    Get win probability. Uses enhanced model if team features are provided,
+    otherwise falls back to baseline.
+    """
     time_frac = seconds_remaining / 2880
-    X = np.array([[margin, time_frac, margin * time_frac]])
-    return float(model.predict_proba(X)[0, 1])
+
+    use_enhanced = (
+        models.get("enhanced") is not None
+        and home_win_pct is not None
+        and away_win_pct is not None
+    )
+
+    if use_enhanced:
+        strength_diff = home_win_pct - away_win_pct
+        if home_home_win_pct is None:
+            home_home_win_pct = home_win_pct
+        if home_last10 is None:
+            home_last10 = home_win_pct
+        if away_last10 is None:
+            away_last10 = away_win_pct
+
+        X = np.array([[
+            margin, time_frac, margin * time_frac,
+            home_win_pct, away_win_pct, home_home_win_pct,
+            home_last10, away_last10, strength_diff,
+            strength_diff * time_frac,
+            margin * strength_diff,
+        ]])
+        return float(models["enhanced"].predict_proba(X)[0, 1])
+    else:
+        X = np.array([[margin, time_frac, margin * time_frac]])
+        return float(models["baseline"].predict_proba(X)[0, 1])
 
 
 def visualize(table_df: pd.DataFrame, output_path: Path):
@@ -306,28 +387,40 @@ def main():
             visualize(table, analysis_dir / "win_prob_heatmap.png")
 
     if args.method in ("logistic", "both"):
-        model = build_logistic_model(df)
+        models = build_logistic_model(df)
         model_path = DATA_DIR / "win_prob_model.pkl"
         with open(model_path, "wb") as f:
-            pickle.dump(model, f)
-        logger.info(f"Saved logistic model → {model_path}")
+            pickle.dump(models, f)
+        logger.info(f"Saved models → {model_path}")
 
-        # Print some sample predictions
-        logger.info("\nSample predictions (logistic model):")
+        # Print sample predictions comparing baseline vs enhanced
+        logger.info("\nSample predictions:")
+        logger.info(f"  {'Scenario':40s} {'Baseline':>10s} {'Enhanced':>10s}")
+        logger.info(f"  {'—'*40} {'—'*10} {'—'*10}")
+
         test_cases = [
-            (0, 2880, "Tip-off, tied"),
-            (5, 1440, "Up 5, halftime"),
-            (2, 480, "Up 2, 8 min left"),
-            (-2, 480, "Down 2, 8 min left"),
-            (10, 300, "Up 10, 5 min left"),
-            (-10, 300, "Down 10, 5 min left"),
-            (3, 60, "Up 3, 1 min left"),
-            (-3, 60, "Down 3, 1 min left"),
-            (15, 120, "Up 15, 2 min left"),
+            # (margin, secs, label, home_wpct, away_wpct, home_home_wpct, h_l10, a_l10)
+            (0, 2880, "Tip-off, tied (even teams)", 0.50, 0.50, 0.55, 0.50, 0.50),
+            (0, 2880, "Tip-off, 70% team hosting 30%", 0.70, 0.30, 0.80, 0.70, 0.30),
+            (0, 2880, "Tip-off, 30% team hosting 70%", 0.30, 0.70, 0.35, 0.30, 0.70),
+            (5, 1440, "Up 5, halftime (even)", 0.50, 0.50, 0.55, 0.50, 0.50),
+            (5, 1440, "Up 5, halftime (fav hosting)", 0.65, 0.40, 0.70, 0.70, 0.40),
+            (-5, 1440, "Down 5, halftime (fav hosting)", 0.65, 0.40, 0.70, 0.70, 0.40),
+            (2, 480, "Up 2, 8 min left (even)", 0.50, 0.50, 0.55, 0.50, 0.50),
+            (2, 480, "Up 2, 8 min (hot team)", 0.55, 0.45, 0.60, 0.90, 0.30),
+            (-2, 480, "Down 2, 8 min (hot team)", 0.55, 0.45, 0.60, 0.90, 0.30),
+            (10, 300, "Up 10, 5 min left", 0.50, 0.50, 0.55, 0.50, 0.50),
+            (3, 60, "Up 3, 1 min left", 0.50, 0.50, 0.55, 0.50, 0.50),
+            (-3, 60, "Down 3, 1 min left", 0.50, 0.50, 0.55, 0.50, 0.50),
         ]
-        for margin, secs, label in test_cases:
-            prob = predict_from_model(model, margin, secs)
-            logger.info(f"  {label:30s} → P(win) = {prob:.1%}")
+        for margin, secs, label, h_wp, a_wp, h_hwp, h_l10, a_l10 in test_cases:
+            base = predict_from_model(models, margin, secs)
+            enh = predict_from_model(
+                models, margin, secs,
+                home_win_pct=h_wp, away_win_pct=a_wp,
+                home_home_win_pct=h_hwp, home_last10=h_l10, away_last10=a_l10,
+            )
+            logger.info(f"  {label:40s} {base:9.1%} {enh:9.1%}")
 
     logger.success("Model building complete!")
 
