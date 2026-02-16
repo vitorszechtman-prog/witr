@@ -11,3 +11,4 @@ websocket-client>=1.6
 aiohttp>=3.9
 loguru>=0.7
 pyarrow>=14.0
+streamlit>=1.30
