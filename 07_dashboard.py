@@ -119,8 +119,56 @@ def model_predict(models: dict, margin: float, seconds_remaining: float,
             ]])
             result["Full"] = float(models["full"].predict_proba(X)[0, 1])
 
-    result["best"] = result.get("Full", result.get("Enhanced", result.get("Baseline", 0.5)))
+    if models.get("momentum") and row is not None:
+        mom_cols = ["run_team", "run_length", "run_points",
+                    "momentum", "scoring_burst", "margin_change_last5"]
+        ext_cols = ["home_net_rating", "away_net_rating", "net_rating_diff",
+                    "home_pace", "away_pace", "expected_pace"]
+        if (all(c in row.index and pd.notna(row.get(c)) for c in mom_cols) and
+                all(c in row.index and pd.notna(row.get(c)) for c in ext_cols)):
+            sd = row.get("strength_diff", 0)
+            nrd = row["net_rating_diff"]
+            ep = row["expected_pace"]
+            X = np.array([[
+                margin, time_frac, margin * time_frac,
+                row["home_win_pct"], row["away_win_pct"], row["home_home_win_pct"],
+                row["home_last10"], row["away_last10"], sd,
+                row["home_net_rating"], row["away_net_rating"], nrd,
+                row["home_pace"], row["away_pace"], ep,
+                sd * time_frac, margin * sd,
+                nrd * time_frac, margin * nrd,
+                ep / 210.0 - 1.0,
+                row["run_team"], row["run_length"], row["run_points"],
+                row["momentum"], row["scoring_burst"], row["margin_change_last5"],
+                row["momentum"] * (1 - time_frac),
+                row["run_points"] * (1 - time_frac),
+                row["run_team"] * row["run_points"] * margin,
+            ]])
+            result["Momentum"] = float(models["momentum"].predict_proba(X)[0, 1])
+
+    result["best"] = result.get("Momentum", result.get("Full", result.get("Enhanced", result.get("Baseline", 0.5))))
     return result
+
+
+@st.cache_data
+def load_sim_trades() -> pd.DataFrame:
+    """Load paper trading simulation trades."""
+    path = DATA_DIR / "kalshi_sim_trades.jsonl"
+    if not path.exists():
+        return pd.DataFrame()
+    import json
+    records = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                records.append(json.loads(line))
+    if not records:
+        return pd.DataFrame()
+    df = pd.DataFrame(records)
+    if "timestamp" in df.columns:
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+    return df
 
 
 def apply_filters(df: pd.DataFrame, f: dict) -> pd.DataFrame:
@@ -432,7 +480,10 @@ def main():
 
     # ── Tabs ──────────────────────────────────────────────────────────────
 
-    tab1, tab2, tab3 = st.tabs(["Historical Data", "Model Comparison", "Game Details"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "Historical Data", "Model Comparison", "Momentum Impact",
+        "Kalshi Simulation", "Game Details",
+    ])
 
     # -- Tab 1: Historical Data --
     with tab1:
@@ -542,8 +593,228 @@ def main():
                 "this interval."
             )
 
-    # -- Tab 3: Game Details --
+    # -- Tab 3: Momentum Impact --
     with tab3:
+        st.subheader("Momentum & Scoring Run Analysis")
+
+        has_mom = "momentum" in filtered.columns and filtered["momentum"].notna().any()
+        has_mom_model = models and models.get("momentum") is not None
+
+        if not has_mom:
+            st.warning(
+                "No momentum features in data. Re-run `01_fetch_pbp_data.py` and "
+                "`02_build_win_prob_model.py` to generate momentum features."
+            )
+        else:
+            st.caption(
+                "Momentum features capture intra-game scoring runs. A team on a 10-0 run "
+                "has positive momentum (+1 direction) which shifts win probability."
+            )
+
+            # Momentum distribution
+            col_a, col_b = st.columns(2)
+            with col_a:
+                mom_games = get_game_outcomes(filtered)
+                if not mom_games.empty and "run_points" in mom_games.columns:
+                    # Win rate by scoring run magnitude
+                    mom_games["run_bucket"] = pd.cut(
+                        mom_games["run_points"].fillna(0).astype(float),
+                        bins=[-1, 0, 4, 8, 12, 100],
+                        labels=["No run", "1-4 pts", "5-8 pts", "9-12 pts", "13+"],
+                    )
+                    run_wr = (
+                        mom_games.groupby("run_bucket", observed=True)
+                        .agg(wins=("home_win", "sum"), games=("home_win", "count"))
+                        .reset_index()
+                    )
+                    run_wr["win_rate"] = run_wr["wins"] / run_wr["games"]
+                    run_wr["label"] = run_wr.apply(
+                        lambda r: f"{r['run_bucket']} (n={r['games']})", axis=1
+                    )
+
+                    chart = alt.Chart(run_wr).mark_bar(color="coral").encode(
+                        x=alt.X("label:N", title="Scoring Run Size", sort=None),
+                        y=alt.Y("win_rate:Q", title="Home Win Rate", scale=alt.Scale(domain=[0, 1])),
+                        tooltip=["label", "win_rate", "games"],
+                    ).properties(title="Win Rate by Scoring Run Size", height=300)
+
+                    rule = alt.Chart(pd.DataFrame({"y": [0.5]})).mark_rule(
+                        strokeDash=[4, 4], color="gray"
+                    ).encode(y="y:Q")
+
+                    st.altair_chart(chart + rule, use_container_width=True)
+
+            with col_b:
+                if not mom_games.empty and "momentum" in mom_games.columns:
+                    # Win rate by momentum direction
+                    mom_games["mom_direction"] = mom_games["momentum"].apply(
+                        lambda x: "Home momentum" if x > 0.2 else (
+                            "Away momentum" if x < -0.2 else "Neutral"
+                        ) if pd.notna(x) else "Neutral"
+                    )
+                    dir_wr = (
+                        mom_games.groupby("mom_direction")
+                        .agg(wins=("home_win", "sum"), games=("home_win", "count"))
+                        .reset_index()
+                    )
+                    dir_wr["win_rate"] = dir_wr["wins"] / dir_wr["games"]
+
+                    chart = alt.Chart(dir_wr).mark_bar().encode(
+                        x=alt.X("mom_direction:N", title="Momentum Direction"),
+                        y=alt.Y("win_rate:Q", title="Home Win Rate", scale=alt.Scale(domain=[0, 1])),
+                        color=alt.Color("mom_direction:N", scale=alt.Scale(
+                            domain=["Away momentum", "Neutral", "Home momentum"],
+                            range=["#e74c3c", "#95a5a6", "#2ecc71"],
+                        ), legend=None),
+                        tooltip=["mom_direction", "win_rate", "games"],
+                    ).properties(title="Win Rate by Momentum Direction", height=300)
+
+                    st.altair_chart(chart + rule, use_container_width=True)
+
+            # Model comparison with and without momentum
+            if has_mom_model:
+                st.subheader("Momentum Model Impact")
+                st.caption(
+                    "Compare how the Momentum model tier differs from the Full model. "
+                    "Larger differences mean the current scoring run is significantly "
+                    "shifting the probability."
+                )
+
+                # Show model comparison for scenarios with big runs
+                scenarios = []
+                for rt, rp, mom_val, label in [
+                    (0, 0, 0.0, "No run"),
+                    (1, 6, 0.5, "Home 6-0 run"),
+                    (1, 10, 0.8, "Home 10-0 run"),
+                    (1, 15, 1.0, "Home 15-0 run"),
+                    (-1, 6, -0.5, "Away 6-0 run"),
+                    (-1, 10, -0.8, "Away 10-0 run"),
+                    (-1, 15, -1.0, "Away 15-0 run"),
+                ]:
+                    mid_margin = median_row.get("home_margin", 0)
+                    mid_secs = median_row.get("seconds_remaining", 720)
+
+                    # Build a row with momentum features
+                    mom_row = median_row.copy()
+                    mom_row["run_team"] = rt
+                    mom_row["run_length"] = abs(rp) // 2
+                    mom_row["run_points"] = rp
+                    mom_row["momentum"] = mom_val
+                    mom_row["scoring_burst"] = int(rp >= 8)
+                    mom_row["margin_change_last5"] = rp * rt
+
+                    full_pred = preds.get("Full", preds.get("best", 0.5))
+                    mom_pred = model_predict(models, mid_margin, mid_secs, mom_row)
+                    scenarios.append({
+                        "Scenario": label,
+                        "Full Model": f"{full_pred:.1%}",
+                        "Momentum Model": f"{mom_pred.get('Momentum', full_pred):.1%}",
+                        "Difference": f"{(mom_pred.get('Momentum', full_pred) - full_pred):+.1%}",
+                    })
+
+                st.dataframe(pd.DataFrame(scenarios), use_container_width=True, hide_index=True)
+
+    # -- Tab 4: Kalshi Simulation --
+    with tab4:
+        st.subheader("Kalshi Paper Trading Performance")
+
+        sim_trades = load_sim_trades()
+
+        if sim_trades.empty:
+            st.info(
+                "No paper trading data yet. Start collecting on Thursday when games resume:\n\n"
+                "```bash\n"
+                "# Start live paper trading (run during games)\n"
+                "python 08_kalshi_sim.py --live\n\n"
+                "# Or replay from logged data\n"
+                "python 08_kalshi_sim.py --replay\n\n"
+                "# Generate report\n"
+                "python 08_kalshi_sim.py --report\n"
+                "```\n\n"
+                "The simulator tracks:\n"
+                "- **Score delay detection**: skips trades when our feed is behind the market\n"
+                "- **Timeout signals**: upweights trades during timeouts (known score)\n"
+                "- **Momentum-aware edge**: uses scoring run features in the model\n"
+                "- **Paper P&L**: tracks hypothetical profit/loss with Kelly sizing"
+            )
+        else:
+            settled = sim_trades[sim_trades["status"] == "settled"].copy()
+
+            if settled.empty:
+                st.info("Trades recorded but none settled yet (games still in progress).")
+            else:
+                # Hero metrics
+                c1, c2, c3, c4 = st.columns(4)
+                total_pnl = settled["realized_pnl"].sum()
+                win_rate = (settled["realized_pnl"] > 0).mean()
+                c1.metric("Total Trades", f"{len(settled)}")
+                c2.metric("Win Rate", f"{win_rate:.1%}")
+                c3.metric("Total P&L", f"${total_pnl:+.2f}")
+                c4.metric("Avg Edge", f"{settled['abs_edge'].mean()*100:.1f}¢")
+
+                # Cumulative P&L chart
+                settled = settled.sort_values("timestamp")
+                settled["cum_pnl"] = settled["realized_pnl"].cumsum()
+
+                pnl_chart = alt.Chart(settled.reset_index()).mark_line(color="green").encode(
+                    x=alt.X("index:Q", title="Trade #"),
+                    y=alt.Y("cum_pnl:Q", title="Cumulative P&L ($)"),
+                    tooltip=["index", "cum_pnl", "home_team", "away_team",
+                             "direction", "realized_pnl"],
+                ).properties(title="Paper Trading P&L Curve", height=300)
+
+                zero = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(
+                    strokeDash=[4, 4], color="red"
+                ).encode(y="y:Q")
+
+                st.altair_chart(pnl_chart + zero, use_container_width=True)
+
+                # By confidence level
+                st.subheader("Performance by Signal Type")
+                st.caption(
+                    "**Timeout** = score is known (highest confidence). "
+                    "**Fresh** = score just changed. "
+                    "**Normal** = routine poll. "
+                    "**Stale** = suspected feed delay (no trades taken)."
+                )
+
+                if "confidence" in settled.columns:
+                    conf_stats = (
+                        settled.groupby("confidence")
+                        .agg(
+                            trades=("realized_pnl", "count"),
+                            wins=("realized_pnl", lambda x: (x > 0).sum()),
+                            pnl=("realized_pnl", "sum"),
+                            avg_edge=("abs_edge", "mean"),
+                        )
+                        .reset_index()
+                    )
+                    conf_stats["win_rate"] = conf_stats["wins"] / conf_stats["trades"]
+                    conf_stats["pnl"] = conf_stats["pnl"].round(2)
+                    conf_stats["avg_edge"] = (conf_stats["avg_edge"] * 100).round(1)
+                    conf_stats["win_rate"] = conf_stats["win_rate"].apply(lambda x: f"{x:.0%}")
+                    conf_stats.columns = ["Signal", "Trades", "Wins", "P&L ($)", "Avg Edge (¢)", "Win Rate"]
+                    st.dataframe(conf_stats, use_container_width=True, hide_index=True)
+
+                # Recent trades table
+                st.subheader("Recent Trades")
+                recent = settled.tail(20).sort_values("timestamp", ascending=False)
+                display = recent[[
+                    "timestamp", "home_team", "away_team", "margin",
+                    "direction", "kalshi_mid", "model_prob", "edge",
+                    "confidence", "bet_size", "realized_pnl",
+                ]].copy()
+                display["model_prob"] = display["model_prob"].apply(lambda x: f"{x:.1%}")
+                display["edge"] = display["edge"].apply(lambda x: f"{x*100:+.1f}¢")
+                display["realized_pnl"] = display["realized_pnl"].apply(lambda x: f"${x:+.2f}")
+                display.columns = [
+                    "Time", "Home", "Away", "Margin", "Dir", "Kalshi (¢)",
+                    "Model", "Edge", "Signal", "Bet ($)", "P&L",
+                ]
+                st.dataframe(display, use_container_width=True, hide_index=True)
+
+    # -- Tab 5: Game Details --
+    with tab5:
         st.subheader(f"Matching Games ({n_games:,})")
 
         display_cols = [

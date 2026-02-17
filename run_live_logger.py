@@ -9,6 +9,7 @@ Usage:
     python run_live_logger.py --interval 10 --dry-run
     python run_live_logger.py --nba-only --with-model  # NBA + win prob, no Kalshi
     python run_live_logger.py --kalshi-ws             # use WebSocket for Kalshi
+    python run_live_logger.py --with-sim              # also run paper trading sim
 
 This is the main script to run during live NBA games to build your database.
 """
@@ -28,6 +29,13 @@ def run_nba_logger(interval: int, dry_run: bool, with_model: bool):
     import importlib
     mod = importlib.import_module("04_nba_live_game_state")
     mod.run_game_state_logger(interval=interval, dry_run=dry_run, with_model=with_model)
+
+
+def run_paper_trader(interval: int, bankroll: float, dry_run: bool):
+    """Thread target for paper trading simulator."""
+    import importlib
+    mod = importlib.import_module("08_kalshi_sim")
+    mod.run_live_sim(interval=interval, bankroll=bankroll, dry_run=dry_run)
 
 
 def run_kalshi_logger(interval: int, dry_run: bool, use_ws: bool):
@@ -66,6 +74,14 @@ def main():
         "--kalshi-ws", action="store_true",
         help="Use WebSocket streaming for Kalshi (lower latency)"
     )
+    parser.add_argument(
+        "--with-sim", action="store_true",
+        help="Also run paper trading simulator (requires --with-model)",
+    )
+    parser.add_argument(
+        "--bankroll", type=float, default=1000.0,
+        help="Starting bankroll for paper trading simulator",
+    )
     args = parser.parse_args()
 
     logger.info("=" * 60)
@@ -75,6 +91,7 @@ def main():
     logger.info(f"Dry run: {args.dry_run}")
     logger.info(f"Model predictions: {args.with_model}")
     logger.info(f"Kalshi mode: {'WebSocket' if args.kalshi_ws else 'REST polling'}")
+    logger.info(f"Paper trading sim: {args.with_sim}")
     logger.info("Press Ctrl+C to stop\n")
 
     threads = []
@@ -96,6 +113,15 @@ def main():
             name="kalshi-logger",
         )
         threads.append(kalshi_thread)
+
+    if args.with_sim:
+        sim_thread = threading.Thread(
+            target=run_paper_trader,
+            args=(args.interval, args.bankroll, args.dry_run),
+            daemon=True,
+            name="paper-trader",
+        )
+        threads.append(sim_thread)
 
     for t in threads:
         logger.info(f"Starting {t.name}...")

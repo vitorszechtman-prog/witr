@@ -156,7 +156,37 @@ def model_predict(models: dict, margin: int, seconds_remaining: int, row: pd.Ser
             ]])
             result["full"] = float(models["full"].predict_proba(X)[0, 1])
 
-    result["best"] = result.get("full", result.get("enhanced", result.get("baseline", 0.5)))
+    # Momentum
+    if models.get("momentum") and row is not None:
+        mom_cols = ["run_team", "run_length", "run_points",
+                    "momentum", "scoring_burst", "margin_change_last5"]
+        ext_cols = ["home_net_rating", "away_net_rating", "net_rating_diff",
+                    "home_pace", "away_pace", "expected_pace"]
+        if (all(c in row.index and pd.notna(row.get(c)) for c in mom_cols) and
+                all(c in row.index and pd.notna(row.get(c)) for c in ext_cols)):
+            strength_diff = row.get("strength_diff", 0)
+            net_rating_diff = row["net_rating_diff"]
+            expected_pace = row["expected_pace"]
+            X = np.array([[
+                margin, time_frac, margin * time_frac,
+                row["home_win_pct"], row["away_win_pct"], row["home_home_win_pct"],
+                row["home_last10"], row["away_last10"], strength_diff,
+                row["home_net_rating"], row["away_net_rating"], net_rating_diff,
+                row["home_pace"], row["away_pace"], expected_pace,
+                strength_diff * time_frac,
+                margin * strength_diff,
+                net_rating_diff * time_frac,
+                margin * net_rating_diff,
+                expected_pace / 210.0 - 1.0,
+                row["run_team"], row["run_length"], row["run_points"],
+                row["momentum"], row["scoring_burst"], row["margin_change_last5"],
+                row["momentum"] * (1 - time_frac),
+                row["run_points"] * (1 - time_frac),
+                row["run_team"] * row["run_points"] * margin,
+            ]])
+            result["momentum"] = float(models["momentum"].predict_proba(X)[0, 1])
+
+    result["best"] = result.get("momentum", result.get("full", result.get("enhanced", result.get("baseline", 0.5))))
     return result
 
 
@@ -251,12 +281,18 @@ def run_backtest(
                 "model_baseline": preds.get("baseline"),
                 "model_enhanced": preds.get("enhanced"),
                 "model_full": preds.get("full"),
+                "model_momentum": preds.get("momentum"),
                 "market_price": market_price,
                 "edge": edge,
                 "abs_edge": abs(edge),
                 "trade": trade,
                 "trade_direction": trade_direction if trade else None,
                 "realized_pnl": realized_pnl if trade else 0.0,
+                "run_team": play.get("run_team", 0),
+                "run_length": play.get("run_length", 0),
+                "run_points": play.get("run_points", 0),
+                "momentum": play.get("momentum", 0.0),
+                "scoring_burst": play.get("scoring_burst", 0),
             })
 
         if (gi + 1) % 500 == 0:

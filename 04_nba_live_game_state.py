@@ -133,10 +133,11 @@ def compute_live_win_prob(
     seconds_remaining: int,
     home_stats: dict,
     away_stats: dict,
+    momentum_features: dict = None,
 ) -> dict:
     """
     Compute win probability using all available model tiers.
-    Returns dict with baseline, enhanced, and full probabilities.
+    Returns dict with baseline, enhanced, full, and momentum probabilities.
     """
     from utils import DATA_DIR  # ensure import
     sys.path.append(str(Path(__file__).parent))
@@ -182,10 +183,155 @@ def compute_live_win_prob(
         ]])
         result["wp_full"] = float(models["full"].predict_proba(X)[0, 1])
 
+    # Momentum (full + intra-game momentum features)
+    if models.get("momentum") and momentum_features:
+        strength_diff = home_stats["win_pct"] - away_stats["win_pct"]
+        net_rating_diff = home_stats["net_rating"] - away_stats["net_rating"]
+        expected_pace = (home_stats["pace"] + away_stats["pace"]) / 2
+        mf = momentum_features
+
+        X = np.array([[
+            margin, time_frac, margin * time_frac,
+            home_stats["win_pct"], away_stats["win_pct"], home_stats["home_win_pct"],
+            home_stats["last10"], away_stats["last10"], strength_diff,
+            home_stats["net_rating"], away_stats["net_rating"], net_rating_diff,
+            home_stats["pace"], away_stats["pace"], expected_pace,
+            strength_diff * time_frac,
+            margin * strength_diff,
+            net_rating_diff * time_frac,
+            margin * net_rating_diff,
+            expected_pace / 210.0 - 1.0,
+            mf["run_team"], mf["run_length"], mf["run_points"],
+            mf["momentum"], mf["scoring_burst"], mf["margin_change_last5"],
+            mf["momentum"] * (1 - time_frac),
+            mf["run_points"] * (1 - time_frac),
+            mf["run_team"] * mf["run_points"] * margin,
+        ]])
+        result["wp_momentum"] = float(models["momentum"].predict_proba(X)[0, 1])
+
     # Best available
-    result["wp_best"] = result.get("wp_full", result.get("wp_enhanced", result.get("wp_baseline", 0.5)))
+    result["wp_best"] = result.get(
+        "wp_momentum",
+        result.get("wp_full", result.get("wp_enhanced", result.get("wp_baseline", 0.5)))
+    )
 
     return result
+
+
+class GameMomentumTracker:
+    """
+    Track intra-game momentum from live score snapshots.
+
+    Since the NBA CDN only gives us scoreboard data (not play-by-play), we detect
+    scoring runs by comparing consecutive snapshots. If only one team's score
+    increases between polls, that team is "scoring" and a run is building.
+    """
+
+    def __init__(self):
+        # game_id → list of (timestamp, home_score, away_score)
+        self._history: dict[str, list[tuple[float, int, int]]] = {}
+
+    def update(self, game_id: str, home_score: int, away_score: int) -> dict:
+        """
+        Record a new score snapshot and compute momentum features.
+
+        Returns dict with momentum features:
+            run_team: +1 home, -1 away, 0 no run
+            run_length: number of consecutive scoring changes by one team
+            run_points: total points in the current run
+            momentum: scoring differential over recent history, normalized
+            scoring_burst: 1 if run_points >= 8
+            margin_change_last5: margin change over last 5 snapshots with changes
+        """
+        now = time.time()
+        history = self._history.setdefault(game_id, [])
+
+        # Only record if score actually changed (or first snapshot)
+        if history and history[-1][1] == home_score and history[-1][2] == away_score:
+            # No change — return last computed features or defaults
+            pass
+        else:
+            history.append((now, home_score, away_score))
+
+        return self._compute_features(game_id)
+
+    def _compute_features(self, game_id: str) -> dict:
+        history = self._history.get(game_id, [])
+        if len(history) < 2:
+            return {
+                "run_team": 0, "run_length": 0, "run_points": 0,
+                "momentum": 0.0, "scoring_burst": 0, "margin_change_last5": 0,
+            }
+
+        # Detect current run by walking backward through scoring changes
+        run_team = 0
+        run_length = 0
+        run_points = 0
+
+        for i in range(len(history) - 1, 0, -1):
+            _, h_now, a_now = history[i]
+            _, h_prev, a_prev = history[i - 1]
+            dh = h_now - h_prev
+            da = a_now - a_prev
+
+            if dh == 0 and da == 0:
+                continue  # no scoring this interval
+
+            if dh > 0 and da == 0:
+                scorer = 1  # home
+            elif da > 0 and dh == 0:
+                scorer = -1  # away
+            else:
+                break  # both scored — run ends
+
+            if run_team == 0:
+                run_team = scorer
+            elif scorer != run_team:
+                break
+
+            run_length += 1
+            run_points += dh + da
+
+        # Momentum: use last ~10 scoring changes
+        lookback = min(len(history), 11)
+        if lookback >= 2:
+            h_recent = history[-1][1] - history[-lookback][1]
+            a_recent = history[-1][2] - history[-lookback][2]
+            total = h_recent + a_recent
+            momentum = (h_recent - a_recent) / max(total, 1)
+        else:
+            momentum = 0.0
+
+        # Margin change over last 5 scoring events
+        scored_changes = []
+        for i in range(len(history) - 1, 0, -1):
+            _, h_now, a_now = history[i]
+            _, h_prev, a_prev = history[i - 1]
+            if h_now != h_prev or a_now != a_prev:
+                scored_changes.append(i)
+                if len(scored_changes) >= 5:
+                    break
+
+        if scored_changes:
+            oldest_idx = scored_changes[-1] - 1 if scored_changes[-1] > 0 else 0
+            margin_now = history[-1][1] - history[-1][2]
+            margin_old = history[oldest_idx][1] - history[oldest_idx][2]
+            margin_change_last5 = margin_now - margin_old
+        else:
+            margin_change_last5 = 0
+
+        return {
+            "run_team": run_team,
+            "run_length": run_length,
+            "run_points": run_points,
+            "momentum": round(momentum, 4),
+            "scoring_burst": int(run_points >= 8),
+            "margin_change_last5": margin_change_last5,
+        }
+
+    def clear_game(self, game_id: str):
+        """Clear history for a finished game."""
+        self._history.pop(game_id, None)
 
 
 class NBALiveClient:
@@ -290,10 +436,11 @@ def run_game_state_logger(
     # Load model and team stats if requested
     models = None
     team_stats_cache = None
+    momentum_tracker = GameMomentumTracker()
     if with_model:
         models = load_model()
         if models:
-            tiers = [k for k in ["baseline", "enhanced", "full"] if models.get(k)]
+            tiers = [k for k in ["baseline", "enhanced", "full", "momentum"] if models.get(k)]
             logger.info(f"  Model tiers loaded: {', '.join(tiers)}")
             team_stats_cache = TeamStatsCache(refresh_interval=1800)
         else:
@@ -305,6 +452,11 @@ def run_game_state_logger(
         try:
             games = client.get_live_games()
             live_games = [g for g in games if g["game_status"] == 2]
+            finished_games = [g for g in games if g["game_status"] == 3]
+
+            # Clean up momentum tracker for finished games
+            for g in finished_games:
+                momentum_tracker.clear_game(g["game_id"])
 
             if not live_games:
                 upcoming = [g for g in games if g["game_status"] == 1]
@@ -318,9 +470,15 @@ def run_game_state_logger(
                 continue
 
             for game in live_games:
+                # Track momentum
+                mom_features = momentum_tracker.update(
+                    game["game_id"], game["home_score"], game["away_score"]
+                )
+
                 record = {
                     "timestamp": utcnow_iso(),
                     **game,
+                    **mom_features,
                 }
 
                 # Add win probability predictions
@@ -334,6 +492,7 @@ def run_game_state_logger(
                         game["seconds_remaining"],
                         home_stats,
                         away_stats,
+                        momentum_features=mom_features,
                     )
                     record.update(wp)
                     record["home_win_pct"] = home_stats["win_pct"]

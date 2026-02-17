@@ -268,6 +268,91 @@ def compute_team_features(outcomes_df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(records)
 
 
+def compute_momentum_features(states: list[dict], lookback_plays: int = 10) -> list[dict]:
+    """
+    Compute intra-game momentum features for each game state.
+
+    For each scoring play, we look at score changes between consecutive plays
+    to detect scoring runs and momentum shifts.
+
+    Features added:
+        - run_team: +1 if home on a run, -1 if away, 0 if no run
+        - run_length: consecutive plays where only one team scored
+        - run_points: total points in the current run
+        - momentum: (home_pts - away_pts) over last N plays, normalized
+        - scoring_burst: 1 if run_points >= 8 (a significant run)
+        - margin_change_last5: margin change over last 5 plays
+    """
+    if len(states) < 2:
+        for s in states:
+            s.update({
+                "run_team": 0, "run_length": 0, "run_points": 0,
+                "momentum": 0.0, "scoring_burst": 0, "margin_change_last5": 0,
+            })
+        return states
+
+    # First compute deltas between consecutive plays
+    for i, s in enumerate(states):
+        if i == 0:
+            s["_delta_home"] = s["home_score"]
+            s["_delta_away"] = s["away_score"]
+        else:
+            s["_delta_home"] = s["home_score"] - states[i - 1]["home_score"]
+            s["_delta_away"] = s["away_score"] - states[i - 1]["away_score"]
+
+    for i, s in enumerate(states):
+        # Current run: look backward for consecutive plays by one team
+        run_team = 0  # +1 home, -1 away
+        run_length = 0
+        run_points = 0
+
+        for j in range(i, 0, -1):
+            dh = states[j]["_delta_home"]
+            da = states[j]["_delta_away"]
+            if dh > 0 and da == 0:
+                scorer = 1  # home scored
+            elif da > 0 and dh == 0:
+                scorer = -1  # away scored
+            else:
+                break  # both scored or no scoring — run ends
+
+            if run_team == 0:
+                run_team = scorer
+            elif scorer != run_team:
+                break  # different team scored — run ends
+
+            run_length += 1
+            run_points += dh + da
+
+        # Momentum: scoring differential over lookback window
+        start_idx = max(0, i - lookback_plays)
+        if i > start_idx:
+            home_pts_window = s["home_score"] - states[start_idx]["home_score"]
+            away_pts_window = s["away_score"] - states[start_idx]["away_score"]
+            total_window = home_pts_window + away_pts_window
+            momentum = (home_pts_window - away_pts_window) / max(total_window, 1)
+        else:
+            momentum = 0.0
+
+        # Margin change over last 5 plays
+        idx5 = max(0, i - 5)
+        margin_change_last5 = s["home_margin"] - states[idx5]["home_margin"]
+
+        s["run_team"] = run_team
+        s["run_length"] = run_length
+        s["run_points"] = run_points
+        s["momentum"] = round(momentum, 4)
+        s["scoring_burst"] = int(run_points >= 8)
+        s["margin_change_last5"] = margin_change_last5
+
+    # Clean up internal fields
+    for s in states:
+        s.pop("_delta_home", None)
+        s.pop("_delta_away", None)
+
+    return states
+
+
 def extract_game_states(
     game_df: pd.DataFrame,
     game_id: int,
@@ -313,6 +398,9 @@ def extract_game_states(
             "away_score": away_score,
             "home_margin": home_score - away_score,
         })
+
+    # Compute momentum features from consecutive scoring plays
+    states = compute_momentum_features(states)
 
     # Determine winner from final score
     last = states[-1]

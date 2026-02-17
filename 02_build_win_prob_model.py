@@ -183,6 +183,12 @@ EXTENDED_FEATURE_COLS = TEAM_FEATURE_COLS + [
     "home_pace", "away_pace", "expected_pace",
 ]
 
+# Momentum features from intra-game scoring runs
+MOMENTUM_FEATURE_COLS = [
+    "run_team", "run_length", "run_points",
+    "momentum", "scoring_burst", "margin_change_last5",
+]
+
 
 def build_logistic_model(df: pd.DataFrame) -> dict:
     """
@@ -298,13 +304,67 @@ def build_logistic_model(df: pd.DataFrame) -> dict:
     else:
         logger.warning("  Extended features (net rating, pace) not found. Re-run 01_fetch_pbp_data.py.")
 
+    # --- Momentum model (full + intra-game momentum) ---
+    has_momentum = all(c in reg.columns for c in MOMENTUM_FEATURE_COLS)
+    momentum_model = None
+    momentum_features = None
+
+    if has_momentum and has_extended:
+        logger.info("Building MOMENTUM logistic model (+ scoring runs, momentum)...")
+
+        mom_data = reg.copy()
+
+        momentum_features = base_features + EXTENDED_FEATURE_COLS + [
+            "strength_x_time",
+            "margin_x_strength",
+            "net_rating_x_time",
+            "margin_x_net_rating",
+            "pace_normalized",
+        ] + MOMENTUM_FEATURE_COLS + [
+            "momentum_x_time",      # momentum matters more late
+            "run_points_x_time",    # big runs late in game are critical
+            "run_x_margin",         # a run while already ahead compounds
+        ]
+        mom_data["strength_x_time"] = mom_data["strength_diff"] * mom_data["time_fraction"]
+        mom_data["margin_x_strength"] = mom_data["home_margin"] * mom_data["strength_diff"]
+        mom_data["net_rating_x_time"] = mom_data["net_rating_diff"] * mom_data["time_fraction"]
+        mom_data["margin_x_net_rating"] = mom_data["home_margin"] * mom_data["net_rating_diff"]
+        mom_data["pace_normalized"] = mom_data["expected_pace"] / 210.0 - 1.0
+        mom_data["momentum_x_time"] = mom_data["momentum"] * (1 - mom_data["time_fraction"])
+        mom_data["run_points_x_time"] = mom_data["run_points"] * (1 - mom_data["time_fraction"])
+        mom_data["run_x_margin"] = mom_data["run_team"] * mom_data["run_points"] * mom_data["home_margin"]
+
+        X_mom = mom_data[momentum_features].values
+        y_mom = mom_data["home_win"].values
+
+        momentum_model = Pipeline([
+            ("poly", PolynomialFeatures(degree=2, include_bias=False)),
+            ("scaler", StandardScaler()),
+            ("lr", LogisticRegression(max_iter=5000, C=1.0)),
+        ])
+        momentum_model.fit(X_mom, y_mom)
+
+        y_pred_mom = momentum_model.predict_proba(X_mom)[:, 1]
+        ll_mom = log_loss(y_mom, y_pred_mom)
+        bs_mom = brier_score_loss(y_mom, y_pred_mom)
+        logger.info(f"  Momentum — Log loss: {ll_mom:.4f}, Brier score: {bs_mom:.4f}")
+        logger.info(f"  Improvement over baseline — Log loss: {ll_base - ll_mom:+.4f}, Brier: {bs_base - bs_mom:+.4f}")
+        if full_model:
+            logger.info(f"  Improvement over full — Log loss: {ll_full - ll_mom:+.4f}, Brier: {bs_full - bs_mom:+.4f}")
+    elif has_momentum:
+        logger.info("  Momentum features found but extended features missing — skipping momentum model.")
+    else:
+        logger.info("  Momentum features not found in data. Re-run 01_fetch_pbp_data.py to regenerate.")
+
     return {
         "baseline": baseline,
         "enhanced": enhanced,
         "full": full_model,
+        "momentum": momentum_model,
         "base_features": base_features,
         "enhanced_features": enhanced_features,
         "full_features": full_features,
+        "momentum_features": momentum_features,
     }
 
 
@@ -321,12 +381,18 @@ def predict_from_model(
     away_net_rating: float = None,
     home_pace: float = None,
     away_pace: float = None,
+    run_team: int = None,
+    run_length: int = None,
+    run_points: int = None,
+    momentum: float = None,
+    scoring_burst: int = None,
+    margin_change_last5: int = None,
     model_tier: str = "best",
 ) -> float:
     """
     Get win probability. Uses the best available model based on provided features.
 
-    model_tier: "baseline", "enhanced", "full", or "best" (auto-select)
+    model_tier: "baseline", "enhanced", "full", "momentum", or "best" (auto-select)
     """
     time_frac = seconds_remaining / 2880
 
@@ -340,17 +406,49 @@ def predict_from_model(
 
     has_team = home_win_pct is not None and away_win_pct is not None
     has_extended = has_team and home_net_rating is not None and away_net_rating is not None
+    has_momentum = (has_extended and run_team is not None and momentum is not None
+                    and run_length is not None and run_points is not None)
 
     # Auto-select best available model
     if model_tier == "best":
-        if has_extended and models.get("full") is not None:
+        if has_momentum and models.get("momentum") is not None:
+            model_tier = "momentum"
+        elif has_extended and models.get("full") is not None:
             model_tier = "full"
         elif has_team and models.get("enhanced") is not None:
             model_tier = "enhanced"
         else:
             model_tier = "baseline"
 
-    if model_tier == "full" and models.get("full") is not None and has_extended:
+    if model_tier == "momentum" and models.get("momentum") is not None and has_momentum:
+        strength_diff = home_win_pct - away_win_pct
+        net_rating_diff = home_net_rating - away_net_rating
+        h_pace = home_pace if home_pace is not None else 210.0
+        a_pace = away_pace if away_pace is not None else 210.0
+        expected_pace = (h_pace + a_pace) / 2
+        _scoring_burst = scoring_burst if scoring_burst is not None else int(run_points >= 8)
+        _margin_change = margin_change_last5 if margin_change_last5 is not None else 0
+
+        X = np.array([[
+            margin, time_frac, margin * time_frac,
+            home_win_pct, away_win_pct, home_home_win_pct,
+            home_last10, away_last10, strength_diff,
+            home_net_rating, away_net_rating, net_rating_diff,
+            h_pace, a_pace, expected_pace,
+            strength_diff * time_frac,
+            margin * strength_diff,
+            net_rating_diff * time_frac,
+            margin * net_rating_diff,
+            expected_pace / 210.0 - 1.0,
+            run_team, run_length, run_points,
+            momentum, _scoring_burst, _margin_change,
+            momentum * (1 - time_frac),          # momentum_x_time
+            run_points * (1 - time_frac),         # run_points_x_time
+            run_team * run_points * margin,        # run_x_margin
+        ]])
+        return float(models["momentum"].predict_proba(X)[0, 1])
+
+    if model_tier in ("momentum", "full") and models.get("full") is not None and has_extended:
         strength_diff = home_win_pct - away_win_pct
         net_rating_diff = home_net_rating - away_net_rating
         h_pace = home_pace if home_pace is not None else 210.0
@@ -481,32 +579,35 @@ def main():
 
         # Print sample predictions comparing all models
         has_full = models.get("full") is not None
+        has_mom = models.get("momentum") is not None
         header = f"  {'Scenario':40s} {'Baseline':>10s} {'Enhanced':>10s}"
         divider = f"  {'—'*40} {'—'*10} {'—'*10}"
         if has_full:
             header += f" {'Full':>10s}"
+            divider += f" {'—'*10}"
+        if has_mom:
+            header += f" {'Momentum':>10s}"
             divider += f" {'—'*10}"
 
         logger.info("\nSample predictions:")
         logger.info(header)
         logger.info(divider)
 
-        # (margin, secs, label, home_wpct, away_wpct, home_home_wpct, h_l10, a_l10, h_nrt, a_nrt, h_pace, a_pace)
+        # (margin, secs, label, h_wp, a_wp, h_hwp, h_l10, a_l10, h_nrt, a_nrt, h_pace, a_pace, run_t, run_l, run_p, mom)
         test_cases = [
-            (0, 2880, "Tip-off, even teams", 0.50, 0.50, 0.55, 0.50, 0.50, 0.0, 0.0, 210, 210),
-            (0, 2880, "Tip-off, 70% hosts 30%", 0.70, 0.30, 0.80, 0.70, 0.30, 6.0, -6.0, 215, 205),
-            (0, 2880, "Tip-off, 30% hosts 70%", 0.30, 0.70, 0.35, 0.30, 0.70, -6.0, 6.0, 205, 215),
-            (5, 1440, "Up 5, half (even)", 0.50, 0.50, 0.55, 0.50, 0.50, 0.0, 0.0, 210, 210),
-            (5, 1440, "Up 5, half (fav hosting)", 0.65, 0.40, 0.70, 0.70, 0.40, 5.0, -3.0, 220, 208),
-            (-5, 1440, "Down 5, half (fav hosting)", 0.65, 0.40, 0.70, 0.70, 0.40, 5.0, -3.0, 220, 208),
-            (2, 480, "Up 2, 8m left (even)", 0.50, 0.50, 0.55, 0.50, 0.50, 0.0, 0.0, 210, 210),
-            (2, 480, "Up 2, 8m (fast pace)", 0.55, 0.45, 0.60, 0.90, 0.30, 3.0, -1.0, 230, 225),
-            (-2, 480, "Down 2, 8m (fast pace)", 0.55, 0.45, 0.60, 0.90, 0.30, 3.0, -1.0, 230, 225),
-            (10, 300, "Up 10, 5 min left", 0.50, 0.50, 0.55, 0.50, 0.50, 0.0, 0.0, 210, 210),
-            (3, 60, "Up 3, 1 min left", 0.50, 0.50, 0.55, 0.50, 0.50, 0.0, 0.0, 210, 210),
-            (-3, 60, "Down 3, 1 min left", 0.50, 0.50, 0.55, 0.50, 0.50, 0.0, 0.0, 210, 210),
+            (0, 2880, "Tip-off, even teams", 0.50, 0.50, 0.55, 0.50, 0.50, 0.0, 0.0, 210, 210, 0, 0, 0, 0.0),
+            (5, 1440, "Up 5, half (even)", 0.50, 0.50, 0.55, 0.50, 0.50, 0.0, 0.0, 210, 210, 0, 0, 0, 0.0),
+            (5, 1440, "Up 5, half (home 10-0 run)", 0.50, 0.50, 0.55, 0.50, 0.50, 0.0, 0.0, 210, 210, 1, 5, 10, 0.8),
+            (-5, 1440, "Down 5, half (away 10-0 run)", 0.50, 0.50, 0.55, 0.50, 0.50, 0.0, 0.0, 210, 210, -1, 5, 10, -0.8),
+            (2, 480, "Up 2, 8m left (no run)", 0.50, 0.50, 0.55, 0.50, 0.50, 0.0, 0.0, 210, 210, 0, 0, 0, 0.0),
+            (2, 480, "Up 2, 8m (home 12-0 run)", 0.55, 0.45, 0.60, 0.70, 0.40, 3.0, -1.0, 220, 210, 1, 6, 12, 0.9),
+            (-2, 480, "Down 2, 8m (away 12-0 run)", 0.55, 0.45, 0.60, 0.70, 0.40, 3.0, -1.0, 220, 210, -1, 6, 12, -0.9),
+            (10, 300, "Up 10, 5 min left", 0.50, 0.50, 0.55, 0.50, 0.50, 0.0, 0.0, 210, 210, 0, 0, 0, 0.0),
+            (10, 300, "Up 10, 5m (home 15-0 run!)", 0.55, 0.45, 0.60, 0.70, 0.40, 3.0, -1.0, 220, 210, 1, 7, 15, 1.0),
+            (3, 60, "Up 3, 1 min left", 0.50, 0.50, 0.55, 0.50, 0.50, 0.0, 0.0, 210, 210, 0, 0, 0, 0.0),
+            (-3, 60, "Down 3, 1m (away 8-0 run)", 0.50, 0.50, 0.55, 0.50, 0.50, 0.0, 0.0, 210, 210, -1, 4, 8, -0.7),
         ]
-        for margin, secs, label, h_wp, a_wp, h_hwp, h_l10, a_l10, h_nrt, a_nrt, h_pace, a_pace in test_cases:
+        for margin, secs, label, h_wp, a_wp, h_hwp, h_l10, a_l10, h_nrt, a_nrt, h_pace, a_pace, rt, rl, rp, mom in test_cases:
             base = predict_from_model(models, margin, secs, model_tier="baseline")
             enh = predict_from_model(
                 models, margin, secs,
@@ -525,6 +626,18 @@ def main():
                     model_tier="full",
                 )
                 line += f" {full:9.1%}"
+            if has_mom:
+                mom_pred = predict_from_model(
+                    models, margin, secs,
+                    home_win_pct=h_wp, away_win_pct=a_wp,
+                    home_home_win_pct=h_hwp, home_last10=h_l10, away_last10=a_l10,
+                    home_net_rating=h_nrt, away_net_rating=a_nrt,
+                    home_pace=h_pace, away_pace=a_pace,
+                    run_team=rt, run_length=rl, run_points=rp,
+                    momentum=mom, scoring_burst=int(rp >= 8), margin_change_last5=rp * rt,
+                    model_tier="momentum",
+                )
+                line += f" {mom_pred:9.1%}"
             logger.info(line)
 
     logger.success("Model building complete!")
